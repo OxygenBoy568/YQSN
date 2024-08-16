@@ -16,10 +16,22 @@ from lagent.agents import BaseAgent, Internlm2Agent
 from lagent.agents.internlm2_agent import Internlm2Protocol
 from lagent.schema import AgentReturn, AgentStatusCode, ModelStatusCode
 from termcolor import colored
+import re
 
 # 初始化日志记录
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def replace_tokens(input_string):
+    # 替换 [UNUSED_TOKEN_144] 和 [UNUSED_TOKEN_143] 
+    input_string = input_string.replace('[UNUSED_TOKEN_144]', '<|action_start|>')
+    input_string = input_string.replace('[UNUSED_TOKEN_143]', '<|action_end|>')
+    
+    # 替换
+    input_string = input_string.replace('[UNUSED_TOKEN_141]', '<|plugin|>')
+    input_string = input_string.replace('[UNUSED_TOKEN_142]', '<|interpreter|>')
+    
+    return input_string
 
 
 class SearcherAgent(Internlm2Agent):
@@ -145,6 +157,7 @@ class WebSearchGraph:
                     dict(question=node['content'], answer=node['response'])
                     for node in parent_nodes
                 ]
+                print(f"👌根据前驱节点的回答{parent_response}\n发起新的询问:{node_content}\n")
                 for answer in agent.stream_chat(
                         node_content,
                         self.nodes['root']['content'],
@@ -153,6 +166,8 @@ class WebSearchGraph:
                         deepcopy((node_name,
                                   dict(response=answer.response,
                                        detail=answer), [])))
+                
+                print(f"回答 = {answer}")
                 self.nodes[node_name]['response'] = answer.response
                 self.nodes[node_name]['detail'] = answer
             except Exception as e:
@@ -210,6 +225,7 @@ class MindSearchAgent(BaseAgent):
         agent_return.inner_steps = deepcopy(inner_history)
         for _ in range(self.max_turn):
             prompt = self._protocol.format(inner_step=inner_history)
+            print(f"😎Planner即将提问,prompt = {prompt}")
             for model_state, response, _ in self.llm.stream_chat(
                     prompt, session_id=random.randint(0, 999999), **kwargs):
                 if model_state.value < 0:
@@ -221,14 +237,19 @@ class MindSearchAgent(BaseAgent):
                 _, language, action = self._protocol.parse(response)
                 if not language and not action:
                     continue
+                # language = remove_unused_tokens(language)
+                
                 code = action['parameters']['command'] if action else ''
                 agent_return.state = self._determine_agent_state(
                     model_state, code, agent_return)
                 agent_return.response = language if not code else code
 
+                # print(f"返回状态agent_return.state = {agent_return.state}")
+
                 # if agent_return.state == AgentStatusCode.STREAM_ING:
                 yield deepcopy(agent_return)
 
+            
             inner_history.append({'role': 'language', 'content': language})
             print(colored(response, 'blue'))
 
@@ -258,7 +279,7 @@ class MindSearchAgent(BaseAgent):
                       as_dict=False,
                       return_early=False):
         for node_name, node, adj in self.execute_code(
-                code, return_early=return_early):
+                code, return_early=return_early):   
             if as_dict and 'detail' in node:
                 node['detail'] = asdict(node['detail'])
             if not adj:
@@ -298,6 +319,7 @@ class MindSearchAgent(BaseAgent):
         yield deepcopy(agent_return)
 
     def _generate_reference(self, agent_return, code, as_dict):
+        # print(f"准备生成引用。\nagent_return.nodes = {agent_return.nodes}\ncode = {code}\n")
         node_list = [
             node.strip().strip('\"') for node in re.findall(
                 r'graph\.node\("((?:[^"\\]|\\.)*?)"\)', code)
@@ -307,10 +329,12 @@ class MindSearchAgent(BaseAgent):
         references = []
         references_url = dict()
         for node_name in node_list:
+            print(f"node_name = {node_name}")
             if as_dict:
                 ref_results = agent_return.nodes[node_name]['detail'][
                     'actions'][0]['result'][0]['content']
             else:
+                # ref_results = extract_bracketed_content(agent_return.nodes[node_name]['response'])
                 ref_results = agent_return.nodes[node_name]['detail'].actions[
                     0].result[0]['content']
             ref_results = json.loads(ref_results)
@@ -321,15 +345,25 @@ class MindSearchAgent(BaseAgent):
                 lambda match: f'[[{int(match.group(1)) + self.ptr}]]', ref)
             numbers = [int(n) for n in re.findall(r'\[\[(\d+)\]\]', ref)]
             if numbers:
-                assert all(str(elem) in ref2url for elem in numbers)
-                references_url.update({
-                    str(idx + self.ptr): ref2url[str(idx)]
-                    for idx in set(numbers)
-                })
-                self.ptr += max(numbers) + 1
-            references.append(updated_ref)
-        return '\n'.join(references), references_url
+                error_occured = False
+                try:
+                    assert all(str(elem) in ref2url for elem in numbers)
+                except AssertionError as e:
+                    print(f"大模型输出的引用编号不合法 AssertionError: {e}")
+                    error_occured = True
+                
+                if error_occured == False:
+                    references_url.update({
+                        str(idx + self.ptr): ref2url[str(idx)]
+                        for idx in set(numbers)
+                    })
+                    self.ptr += max(numbers) + 1
 
+            references.append(updated_ref)
+        res = '\n'.join(references), references_url
+        print(f"🔍搜索完成，结果 = {res}\n")
+        return res
+    
     def execute_code(self, command: str, return_early=False):
 
         def extract_code(text: str) -> str:
@@ -355,6 +389,7 @@ class MindSearchAgent(BaseAgent):
                 logger.exception(f'Error executing code: {e}')
 
         command = extract_code(command)
+        print(f"😎执行代码：{command}\n")
         producer_thread = threading.Thread(target=run_command,
                                            args=(command, ))
         producer_thread.start()
@@ -368,6 +403,7 @@ class MindSearchAgent(BaseAgent):
                 item = self.local_dict.get('graph').searcher_resp_queue.get(
                     timeout=60)
                 if item is WebSearchGraph.end_signal:
+                    print(f"👌收到Graph的结束信号，ordered_nodes = {ordered_nodes}\n")
                     for node_name in ordered_nodes:
                         # resp = None
                         for resp in responses[node_name]:

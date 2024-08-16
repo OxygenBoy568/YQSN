@@ -71,7 +71,7 @@ def predict(history_planner, history_searcher):
     raw_response = requests.post(url,
                                  headers=headers,
                                  data=json.dumps(data),
-                                 timeout=20,
+                                 timeout=120,
                                  stream=True)
 
     for resp in streaming(raw_response):

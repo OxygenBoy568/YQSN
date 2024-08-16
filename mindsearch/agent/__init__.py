@@ -18,6 +18,7 @@ LLM = {}
 
 
 def init_agent(lang='cn', model_format='internlm_server'):
+    print("初始化大模型...")
     llm = LLM.get(model_format, None)
     if llm is None:
         llm_cfg = getattr(llm_factory, model_format)
@@ -44,9 +45,9 @@ def init_agent(lang='cn', model_format='internlm_server'):
             llm=llm,
             plugin_executor=ActionExecutor(
                 BingBrowser(searcher_type='DuckDuckGoSearch',
-                            topk=6,
+                            topk=1,
                             api_key=os.environ.get('BING_API_KEY',
-                                                   'YOUR BING API'))),
+                                                   'YOUR BING API'), proxy = "http://10.99.93.35:8080")),
             protocol=MindSearchProtocol(
                 meta_prompt=datetime.now().strftime(
                     'The current date is %Y-%m-%d.'),

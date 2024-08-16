@@ -38,10 +38,10 @@ fewshot_example_cn = """
 
 ### search
 当我希望搜索"王者荣耀现在是什么赛季"时，我会按照以下格式进行操作:
-现在是2024年，因此我应该搜索王者荣耀赛季关键词<|action_start|><|plugin|>{{"name": "FastWebBrowser.search", "parameters": {{"query": ["王者荣耀 赛季", "2024年王者荣耀赛季"]}}}}<|action_end|>
+现在是2024年，因此我应该搜索王者荣耀赛季关键词。对应的代码为：<|action_start|><|plugin|> { { "name": "FastWebBrowser.search", "parameters": { { "query": ["王者荣耀 赛季", "2024年王者荣耀赛季"] } } } } <|action_end|>
 
 ### select
-为了找到王者荣耀s36赛季最强射手，我需要寻找提及王者荣耀s36射手的网页。初步浏览网页后，发现网页0提到王者荣耀s36赛季的信息，但没有具体提及射手的相关信息。网页3提到“s36最强射手出现？”，有可能包含最强射手信息。网页13提到“四大T0英雄崛起，射手荣耀降临”，可能包含最强射手的信息。因此，我选择了网页3和网页13进行进一步阅读。<|action_start|><|plugin|>{{"name": "FastWebBrowser.select", "parameters": {{"index": [3, 13]}}}}<|action_end|>
+我选择网页3和网页13进行进一步阅读。我必须要编写对应的代码：<|action_start|><|plugin|>{{"name": "FastWebBrowser.select", "parameters": {{"index": [3, 13]}}}}<|action_end|>
 """
 
 fewshot_example_en = """
@@ -177,7 +177,7 @@ def node(self, node_name: str) -> str
     <|action_start|><|interpreter|>```python
     # 你的代码块
     ```<|action_end|>
-7. 最后一次回复应该是添加node_name为'response'的 response 节点，必须添加 response 节点，不要添加其他节点
+7. 最后一次回复应该是添加node_name为'response'的 response 节点，**最后一次必须添加 response 节点**，不要添加其他节点
 """
 
 GRAPH_PROMPT_EN = """## Character Profile
