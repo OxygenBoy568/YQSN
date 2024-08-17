@@ -107,6 +107,7 @@ class MindSearchProtocol(Internlm2Protocol):
         if self.meta_prompt:
             formatted.append(dict(role='system', content=self.meta_prompt))
         if self.plugin_prompt:
+            print(f"Searcher准备中 plugin_executor = {plugin_executor.get_actions_info()}\n plugin_prompt = {self.plugin_prompt}")
             plugin_prompt = self.plugin_prompt.format(tool_info=json.dumps(
                 plugin_executor.get_actions_info(), ensure_ascii=False))
             formatted.append(

@@ -11,7 +11,17 @@ from agent.mindsearch_prompt import (
     searcher_input_template_cn, searcher_input_template_en,
     searcher_system_prompt_cn, searcher_system_prompt_en)
 
+from openai import OpenAI
+
+
 if __name__ == "__main__":
+    # api_call_example.py
+    from openai import OpenAI
+    client = OpenAI(api_key="0",base_url="http://0.0.0.0:8000/v1")
+    messages = [{"role": "user", "content": "Who are you?"}]
+    result = client.chat.completions.create(messages=messages, model="qwen")
+    print(result.choices[0].message)
+
     # bing = BingBrowser(searcher_type='DuckDuckGoSearch', topk=6, proxy = "http://10.99.93.35:8080")
     # print(bing.search("北京"))
 

@@ -30,9 +30,9 @@ def init_agent(lang='cn', model_format='internlm_server'):
 
     interpreter_prompt = GRAPH_PROMPT_CN if lang == 'cn' else GRAPH_PROMPT_EN
     plugin_prompt = searcher_system_prompt_cn if lang == 'cn' else searcher_system_prompt_en
-    if model_format == 'gpt4':
-        interpreter_prompt += graph_fewshot_example_cn if lang == 'cn' else graph_fewshot_example_en
-        plugin_prompt += fewshot_example_cn if lang == 'cn' else fewshot_example_en
+    # if model_format == 'gpt4': # 20240816:现在gpt4实际上是书生浦语的线上模型。因此去掉。
+    #     interpreter_prompt += graph_fewshot_example_cn if lang == 'cn' else graph_fewshot_example_en
+    #     plugin_prompt += fewshot_example_cn if lang == 'cn' else fewshot_example_en
 
     agent = MindSearchAgent(
         llm=llm,
