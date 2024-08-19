@@ -127,6 +127,11 @@ class MindSearchProtocol(Internlm2Protocol):
 class WebSearchGraph:
     end_signal = 'end'
     searcher_cfg = dict()
+    last_added_nodes = []
+    nodes = {}
+    adjacency_list = defaultdict(list)
+    nodes_snapshot = {}
+    adjacency_list_snapshot = defaultdict(list)
 
     def __init__(self):
         self.nodes = {}
@@ -136,13 +141,18 @@ class WebSearchGraph:
         self.searcher_resp_queue = queue.Queue()
 
     def add_root_node(self, node_content, node_name='root'):
+        if node_name in self.nodes:
+            self.abort()
+            raise Exception("添加了重复的 root 点")
         self.nodes[node_name] = dict(content=node_content, type='root')
         self.adjacency_list[node_name] = []
         self.searcher_resp_queue.put((node_name, self.nodes[node_name], []))
 
     def add_node(self, node_name, node_content):
-        self.nodes[node_name] = dict(content=node_content, type='searcher')
-        self.adjacency_list[node_name] = []
+        if node_name in self.nodes:
+            self.abort()
+            raise Exception("添加了重复的点")
+        
 
         def model_stream_thread():
             agent = SearcherAgent(**self.searcher_cfg)
@@ -174,14 +184,23 @@ class WebSearchGraph:
             except Exception as e:
                 logger.exception(f'Error in model_stream_thread: {e}')
 
-        self.future_to_query[self.executor.submit(
-            model_stream_thread)] = f'{node_name}-{node_content}'
+        # 添加节点的时候不立即运行 Searcher，而是等最后 graph.node("xxx") 时再运行。
+        # self.future_to_query[self.executor.submit(model_stream_thread)] = f'{node_name}-{node_content}'
+        self.nodes[node_name] = dict(content=node_content, type='searcher', func = model_stream_thread)
+        self.adjacency_list[node_name] = []
+        self.last_added_nodes.append(node_name)
 
     def add_response_node(self, node_name='response'):
+        if node_name in self.nodes:
+            self.abort()
+            raise Exception("添加了重复的 response 点")
         self.nodes[node_name] = dict(type='end')
         self.searcher_resp_queue.put((node_name, self.nodes[node_name], []))
 
     def add_edge(self, start_node, end_node):
+        if start_node in self.last_added_nodes and end_node in self.last_added_nodes:
+            self.abort()
+            raise Exception("某一条边连接的两个点均是在同一轮中添加的。")
         self.adjacency_list[start_node].append(
             dict(id=str(uuid.uuid4()), name=end_node, state=2))
         self.searcher_resp_queue.put((start_node, self.nodes[start_node],
@@ -192,7 +211,23 @@ class WebSearchGraph:
         self.adjacency_list = defaultdict(list)
 
     def node(self, node_name):
+        self.commit()
+        if node_name != "response" and node_name != "root":
+            # 运行 Searcher
+            self.future_to_query[self.executor.submit(self.nodes[node_name]['func'])] = f'{node_name}-{self.nodes[node_name]["content"]}'
         return self.nodes[node_name].copy()
+    
+    def commit(self):
+        self.last_added_nodes.clear()
+        self.nodes_snapshot = deepcopy(self.nodes)
+        self.adjacency_list_snapshot = deepcopy(self.adjacency_list)
+    def abort(self):
+        self.last_added_nodes.clear()
+        self.nodes = deepcopy(self.nodes_snapshot)
+        self.adjacency_list = deepcopy(self.adjacency_list_snapshot)
+
+    def get_last_added_nodes(self):
+        return self.last_added_nodes
 
 
 class MindSearchAgent(BaseAgent):
@@ -226,9 +261,9 @@ class MindSearchAgent(BaseAgent):
         agent_return.inner_steps = deepcopy(inner_history)
         for _ in range(self.max_turn):
             prompt = self._protocol.format(inner_step=inner_history)
+            print(f"历史inner_history = {inner_history}")
             print(f"😎Planner即将提问,prompt = {prompt}")
-            for model_state, response, _ in self.llm.stream_chat(
-                    prompt, session_id=random.randint(0, 999999), **kwargs):
+            for model_state, response, _ in self.llm.stream_chat(prompt, session_id=random.randint(0, 999999), **kwargs):
                 if model_state.value < 0:
                     agent_return.state = getattr(AgentStatusCode,
                                                  model_state.name)
@@ -251,16 +286,27 @@ class MindSearchAgent(BaseAgent):
                 yield deepcopy(agent_return)
 
             
-            inner_history.append({'role': 'language', 'content': language})
-            print(colored(response, 'blue'))
+            # inner_history.append({'role': 'language', 'content': language})
+            # print(colored(response, 'blue'))
 
             if code:
-                yield from self._process_code(agent_return, inner_history,
-                                              code, as_dict, return_early)
+                try:
+                    yield from self._process_code(agent_return, inner_history,code, as_dict, return_early)
+                except Exception as e:
+                    print("😢运行代码时出现异常。即将重新生成代码...")
+                    continue
+                # inner_history.append({'role': 'language', 'content': language})
+                # print(f"代码执行完毕，向历史追加：{language}")
             else:
                 agent_return.state = AgentStatusCode.END
                 yield deepcopy(agent_return)
+                print("本次询问 Planner 任务即将结束。")
                 return
+            
+            # inner_history.append({'role': 'language', 'content': language})
+            print(colored(response, 'blue'))
+            
+            
 
         agent_return.state = AgentStatusCode.END
         yield deepcopy(agent_return)
@@ -377,6 +423,8 @@ class MindSearchAgent(BaseAgent):
                 return single_match.group(1)
             return text
 
+        error_occured = False
+
         def run_command(cmd):
             try:
                 exec(cmd, globals(), self.local_dict)
@@ -387,10 +435,17 @@ class MindSearchAgent(BaseAgent):
                 plan_graph.future_to_query.clear()
                 plan_graph.searcher_resp_queue.put(plan_graph.end_signal)
             except Exception as e:
-                logger.exception(f'Error executing code: {e}')
+                logger.exception(f'运行 Python 代码时出现异常：{e}')
+                print(f"运行 Python 代码时出现异常：{e}")
+                error_occured = True
+                plan_graph = self.local_dict.get('graph')
+                plan_graph.searcher_resp_queue.put(plan_graph.end_signal)
+                # raise
 
         command = extract_code(command)
         print(f"😎执行代码：{command}\n")
+        
+        # Python 解释器运行时如果抛出异常，那么需要继续抛出给 Planner
         producer_thread = threading.Thread(target=run_command,
                                            args=(command, ))
         producer_thread.start()
@@ -399,6 +454,7 @@ class MindSearchAgent(BaseAgent):
         ordered_nodes = []
         active_node = None
 
+        # 用于前端页面展示建图的过程 和 Searcher 生成答案的过程
         while True:
             try:
                 item = self.local_dict.get('graph').searcher_resp_queue.get(
@@ -441,5 +497,9 @@ class MindSearchAgent(BaseAgent):
             except queue.Empty:
                 if not producer_thread.is_alive():
                     break
+        # Python 解释器运行时如果抛出异常，那么需要继续抛出给 Planner
         producer_thread.join()
+        print("生产者线程已经停止。")
+        if error_occured == True:
+            raise Exception("运行 Python 代码时出现异常。")
         return
