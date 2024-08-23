@@ -9,9 +9,10 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import asdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Union, Optional
 
 from lagent.actions import ActionExecutor
+from lagent.llms import BaseAPIModel, BaseModel
 from lagent.agents import BaseAgent, Internlm2Agent
 from lagent.agents.internlm2_agent import Internlm2Protocol
 from lagent.schema import AgentReturn, AgentStatusCode, ModelStatusCode
@@ -21,6 +22,8 @@ import re
 # 初始化日志记录
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+use_short_history = True
 
 def replace_tokens(input_string):
     # 替换 [UNUSED_TOKEN_144] 和 [UNUSED_TOKEN_143] 
@@ -36,17 +39,27 @@ def replace_tokens(input_string):
 
 class SearcherAgent(Internlm2Agent):
 
-    def __init__(self, template='{query}', **kwargs) -> None:
-        super().__init__(**kwargs)
+    def __init__(self, llm: Union[BaseModel, BaseAPIModel], template='{query}', **kwargs) -> None:
+        super().__init__(llm, **kwargs)
+        self.llm = llm
         self.template = template
+    
+    # 直接给出问题即可，会直接返回结果
+    def llm_stream_chat(self, question: str):
+        message = dict(role='user', content=question)
+        response = ""
+        for state, res, _ in self.llm.stream_chat([message], session_id=random.randint(0, 999999)):
+            if state == ModelStatusCode.END:
+                response = res
+                break
+        return response
 
     def stream_chat(self,
                     question: str,
                     root_question: str = None,
                     parent_response: List[dict] = None,
                     **kwargs) -> AgentReturn:
-        message = self.template['input'].format(question=question,
-                                                topic=root_question)
+        message = self.template['input'].format(question=question, topic=root_question)
         if parent_response:
             if 'context' in self.template:
                 parent_response = [
@@ -147,6 +160,7 @@ class WebSearchGraph:
         self.nodes[node_name] = dict(content=node_content, type='root')
         self.adjacency_list[node_name] = []
         self.searcher_resp_queue.put((node_name, self.nodes[node_name], []))
+        self.last_added_nodes.append(node_name)
 
     def add_node(self, node_name, node_content):
         if node_name in self.nodes:
@@ -173,14 +187,25 @@ class WebSearchGraph:
                         node_content,
                         self.nodes['root']['content'],
                         parent_response=parent_response):
+                    # print(f"返回：{answer}")
+                    # if answer.state == AgentStatusCode.END: # 大模型回答结束，但在这之后还需要生成短回答。
+                    #     answer.state = AgentStatusCode.STREAM_ING
                     self.searcher_resp_queue.put(
-                        deepcopy((node_name,
-                                  dict(response=answer.response,
-                                       detail=answer), [])))
+                        deepcopy((node_name, dict(response=answer.response, detail=answer), [])))
                 
-                print(f"回答 = {answer}")
+                # print(f"完整回答：{answer.response}")
+
+                # prompt = f"""{answer.response}\n\n请你结合上面的材料，回答：{node_content}\n\n请将答案控制在**20个字以内**。"""
+                # short_answer = agent.llm_stream_chat(prompt)
+                # print(f"😈短答案：{short_answer}")
+
                 self.nodes[node_name]['response'] = answer.response
                 self.nodes[node_name]['detail'] = answer
+                # self.nodes[node_name]['short_response'] = short_answer
+
+                # self.nodes[node_name]['response'] = answer.response
+                # self.nodes[node_name]['detail'] = answer
+
             except Exception as e:
                 logger.exception(f'Error in model_stream_thread: {e}')
 
@@ -196,9 +221,10 @@ class WebSearchGraph:
             raise Exception("添加了重复的 response 点")
         self.nodes[node_name] = dict(type='end')
         self.searcher_resp_queue.put((node_name, self.nodes[node_name], []))
+        self.last_added_nodes.append(node_name)
 
     def add_edge(self, start_node, end_node):
-        if start_node in self.last_added_nodes and end_node in self.last_added_nodes:
+        if start_node!="root" and start_node in self.last_added_nodes and end_node in self.last_added_nodes:
             self.abort()
             raise Exception("某一条边连接的两个点均是在同一轮中添加的。")
         self.adjacency_list[start_node].append(
@@ -254,14 +280,24 @@ class MindSearchAgent(BaseAgent):
         self.local_dict.clear()
         self.ptr = 0
         inner_history = message[:]
+        short_inner_history = message[:]
         agent_return = AgentReturn()
         agent_return.type = 'planner'
         agent_return.nodes = {}
         agent_return.adjacency_list = {}
         agent_return.inner_steps = deepcopy(inner_history)
         for _ in range(self.max_turn):
-            prompt = self._protocol.format(inner_step=inner_history)
+            prompt = []
+            if self._protocol.response_prompt in short_inner_history[len(short_inner_history)-1]['content']:
+                for o in inner_history:
+                    if o['role'] == 'user' or o['role'] == 'environment':
+                        prompt.append(o)
+            elif use_short_history:
+                prompt = self._protocol.format(inner_step=short_inner_history)
+            else:
+                prompt = self._protocol.format(inner_step=inner_history)
             print(f"历史inner_history = {inner_history}")
+            print(f"短历史inner_history = {short_inner_history}")
             print(f"😎Planner即将提问,prompt = {prompt}")
             for model_state, response, _ in self.llm.stream_chat(prompt, session_id=random.randint(0, 999999), **kwargs):
                 if model_state.value < 0:
@@ -291,7 +327,7 @@ class MindSearchAgent(BaseAgent):
 
             if code:
                 try:
-                    yield from self._process_code(agent_return, inner_history,code, as_dict, return_early)
+                    yield from self._process_code(agent_return, inner_history, short_inner_history, code, as_dict, return_early)
                 except Exception as e:
                     print("😢运行代码时出现异常。即将重新生成代码...")
                     continue
@@ -322,6 +358,7 @@ class MindSearchAgent(BaseAgent):
     def _process_code(self,
                       agent_return,
                       inner_history,
+                      short_inner_history,
                       code,
                       as_dict=False,
                       return_early=False):
@@ -348,7 +385,7 @@ class MindSearchAgent(BaseAgent):
                     neighbor['state'] = state
             if not adj:
                 yield deepcopy((agent_return, node_name))
-        reference, references_url = self._generate_reference(
+        reference, references_url, short_refs = self._generate_reference(
             agent_return, code, as_dict)
         inner_history.append({
             'role': 'tool',
@@ -358,6 +395,16 @@ class MindSearchAgent(BaseAgent):
         inner_history.append({
             'role': 'environment',
             'content': reference,
+            'name': 'plugin'
+        })
+        short_inner_history.append({
+            'role': 'tool',
+            'content': code,
+            'name': 'plugin'
+        })
+        short_inner_history.append({
+            'role': 'environment',
+            'content': short_refs,
             'name': 'plugin'
         })
         agent_return.inner_steps = deepcopy(inner_history)
@@ -372,9 +419,13 @@ class MindSearchAgent(BaseAgent):
                 r'graph\.node\("((?:[^"\\]|\\.)*?)"\)', code)
         ]
         if 'add_response_node' in code:
-            return self._protocol.response_prompt, dict()
+            print("检测到 response 节点")
+            return self._protocol.response_prompt, dict(), self._protocol.response_prompt
         references = []
         references_url = dict()
+
+        short_refs = ""
+
         for node_name in node_list:
             print(f"node_name = {node_name}")
             if as_dict:
@@ -387,6 +438,18 @@ class MindSearchAgent(BaseAgent):
             ref_results = json.loads(ref_results)
             ref2url = {idx: item['url'] for idx, item in ref_results.items()}
             ref = f"## {node_name}\n\n{agent_return.nodes[node_name]['response']}\n"
+            
+            # 生成短答案。
+            if use_short_history == True:
+                prompt = f"""{agent_return.nodes[node_name]['response']}\n\n请你结合上面的材料，回答：{node_name}\n\n请将答案控制在**20个字以内**。"""
+                
+                for state, res, _ in self.llm.stream_chat(prompt, session_id=random.randint(0, 999999)):
+                    if state == ModelStatusCode.END:
+                        short_answer = res
+                        break
+                print(f"😈短答案：{short_answer}")
+                short_refs = short_refs + f"##{node_name}\n\n{short_answer}\n"
+
             updated_ref = re.sub(
                 r'\[\[(\d+)\]\]',
                 lambda match: f'[[{int(match.group(1)) + self.ptr}]]', ref)
@@ -407,8 +470,9 @@ class MindSearchAgent(BaseAgent):
                     self.ptr += max(numbers) + 1
 
             references.append(updated_ref)
-        res = '\n'.join(references), references_url
-        print(f"🔍搜索完成，结果 = {res}\n")
+
+        res = '\n'.join(references), references_url, short_refs
+        print(f"🔍引用生成完成，结果 = {res}\n")
         return res
     
     def execute_code(self, command: str, return_early=False):
